@@ -1,12 +1,11 @@
 # frozen_string_literal: true
 
 require "jwt"
+require "jwk-loader"
 
 module Teams
   module Auth
     class JwtValidator
-      JWKS_CACHE_TTL = 10 * 60
-      JWKS_CACHE_MAX_ENTRIES = 5
       CLOCK_TOLERANCE = 5 * 60
 
       def initialize(client_id:, tenant_id: nil, cloud: PUBLIC_CLOUD, http: nil)
@@ -14,7 +13,7 @@ module Teams
         @tenant_id = tenant_id
         @cloud = cloud
         @http = http || Common::HttpClient.new
-        @jwks = {}
+        @jwks_loaders = {}
         # The validator is shared across request threads; the mutex keeps
         # concurrent cold-cache requests from fetching the JWKS repeatedly.
         @jwks_mutex = Mutex.new
@@ -71,41 +70,22 @@ module Teams
         uri = jwks_uri_for_issuer(issuer)
 
         @jwks_mutex.synchronize do
-          cache = @jwks[uri] ||= {}
-          cached = cache.delete(kid)
-          if cached && monotonic_time < cached[:expires_at]
-            cache[kid] = cached
-            return cached[:key]
+          provider = @jwks_loaders[uri] ||= JwkLoader.for_uri(uri:, cache: JwkLoader::MemoryCache.new)
+          loader = lambda do |options|
+            keys = provider.call(options).select do |key|
+              key[:kty] == "RSA" && [nil, "sig"].include?(key[:use])
+            end
+            if kid.nil? && keys.size != 1
+              raise AuthenticationError, "JWT signing key was not found"
+            end
+
+            JWT::JWK::Set.new(keys)
           end
 
-          key = fetch_signing_key(uri, kid)
-          cache.shift if cache.size >= JWKS_CACHE_MAX_ENTRIES
-          cache[kid] = { key:, expires_at: monotonic_time + JWKS_CACHE_TTL }
-          key
+          JWT::JWK::KeyFinder.new(jwks: loader, allow_nil_kid: true).key_for(kid)
         end
-      end
-
-      def fetch_signing_key(uri, kid)
-        document = @http.get(uri)
-        unless document.is_a?(Hash) && document["keys"].is_a?(Array)
-          raise AuthenticationError, "JWT signing keys response is invalid"
-        end
-
-        keys = document["keys"].select do |key|
-          key.is_a?(Hash) && key["kty"] == "RSA" && [nil, "sig"].include?(key["use"])
-        end
-        if kid.nil? && keys.size != 1
-          raise AuthenticationError, "JWT signing key was not found"
-        end
-        key = kid.nil? ? keys.first : keys.find { |candidate| candidate["kid"] == kid }
-        raise AuthenticationError, "JWT signing key was not found" unless key
-
-        unless [key["n"], key["e"]].all? { |value| value.is_a?(String) && !value.empty? }
-          raise AuthenticationError, "JWT signing key is invalid"
-        end
-
-        JWT::JWK.import(key).verify_key
-      rescue HttpError, Faraday::Error, JWT::DecodeError, ArgumentError, OpenSSL::PKey::PKeyError, OpenSSL::ASN1::ASN1Error => error
+      rescue JSON::ParserError, Timeout::Error, SocketError, IOError, SystemCallError, ArgumentError,
+             OpenSSL::SSL::SSLError, OpenSSL::PKey::PKeyError, OpenSSL::ASN1::ASN1Error => error
         raise AuthenticationError, "Unable to retrieve JWT signing key: #{error.message}"
       end
 
@@ -145,10 +125,6 @@ module Teams
 
       def normalize_url(value)
         value.to_s.sub(%r{/+\z}, "").downcase
-      end
-
-      def monotonic_time
-        Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
     end
   end

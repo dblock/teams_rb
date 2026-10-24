@@ -4,7 +4,7 @@ How the app proves itself to Teams, and how Teams proves itself to the app.
 
 ## Inbound validation
 
-Every `POST /api/messages` request must carry a Bot Framework JWT. Token decoding, JWK import, RS256 signature verification, and standard claims use the established [`jwt` gem](https://github.com/jwt/ruby-jwt); Teams-specific endpoint selection, signing-key caching, and service URL checks remain in this SDK.
+Every `POST /api/messages` request must carry a Bot Framework JWT. Token decoding, JWK import, RS256 signature verification, and standard claims use the established [`jwt` gem](https://github.com/jwt/ruby-jwt). This experimental branch delegates JWKS retrieval and caching to [`jwk-loader`](https://github.com/anakinj/jwk-loader), while retaining Teams-specific endpoint selection and service URL checks.
 
 The app validates:
 
@@ -18,11 +18,13 @@ Rejected requests get a 401 with a warn log line. Requests are rejected wholesal
 
 ### Signing-key caching and rotation
 
-The signing-key cache follows the defaults used by the [JavaScript Teams SDK](https://github.com/microsoft/teams.js/blob/3420e8899e71ed7cc74711d62f07c25e73d45b42/packages/apps/src/middleware/auth/jwt-validator.ts) and its [`jwks-rsa` 4.1.0 dependency](https://github.com/auth0/node-jwks-rsa/blob/v4.1.0/src/wrappers/cache.js): each JWKS endpoint has a least-recently-used cache of at most five public keys, indexed by JWT `kid`. Only the requested key is cached, even when a downloaded key document contains several keys.
+**Draft experiment, not a production-ready replacement for [PR #12](https://github.com/bavmind/teams_rb/pull/12).** This branch deliberately uses `jwk-loader`'s default rollover policy rather than implementing the parent's JavaScript-style cache. The feature discussion is tracked in [jwk-loader issue #15](https://github.com/anakinj/jwk-loader/issues/15).
 
-Keys expire ten minutes after retrieval. Cache hits update recency but do not extend expiry. An uncached or expired key triggers a fresh JWKS fetch immediately, including when another key was fetched moments earlier. Successful concurrent lookups share the cached result under a mutex. There is no background refresh, negative caching, retry cooldown, or fetch rate limit, matching the JavaScript SDK's current configuration. Arbitrary unknown key IDs can therefore cause repeated outbound requests; account for this when protecting your bot endpoint.
+Each trusted JWKS URI has a provider with an isolated memory cache that stores the whole key set. An unknown `kid` can invalidate and re-fetch that set only after the default fifteen-minute grace period. Known keys have no TTL or capacity limit: even after Microsoft removes a key, a process can continue using its cached copy indefinitely until an unknown key triggers refresh. There is no background refresh, and refresh timing uses the loader's wall clock. The existing validator mutex still coordinates concurrent lookups.
 
-Key-fetch, discovery, and malformed key-response failures reject authentication with HTTP 401 and a warn log line through the Rack adapter. Failed lookups are not cached and may be retried immediately. Other unexpired cached keys remain usable, but expired keys are never used as a fallback during an outage. Bot Framework discovery still resolves `jwks_uri` once per validator; tenant keys still use the configured tenant endpoint. Existing issuer, audience, service URL, and RS256 checks remain in place; this matches JavaScript's cache defaults, not every feature of its authentication stack.
+The loader fetches JWKS through `Net::HTTP`; the validator's injected `http:` client now handles only Bot Framework discovery. JWT, JSON, transport, and key-import failures become authentication errors, yielding logged HTTP 401 responses through the Rack adapter. After invalidation, a failed fetch does not retain the previous key set. The loader also parses response bodies without explicitly rejecting non-2xx HTTP statuses; an error object can become a cached empty set that prevents immediate recovery during the grace period. These are intentional, documented limitations of this draft, not equivalent guarantees to the parent PR.
+
+Bot Framework discovery still resolves `jwks_uri` once per validator, and tenant keys still use the configured tenant endpoint. RS256, issuer, audience, five-minute clock tolerance, service URL checks, and rejection of ambiguous missing-`kid` tokens remain in place.
 
 ## Outbound bot tokens
 

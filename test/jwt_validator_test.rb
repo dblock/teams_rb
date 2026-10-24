@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "webmock/minitest"
 
 class JwtValidatorTest < Minitest::Test
   def test_validates_rs256_token
@@ -146,7 +147,7 @@ class JwtValidatorTest < Minitest::Test
     validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
 
     error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
-    assert_equal "JWT signing key was not found", error.message
+    assert_includes error.message, "Could not find public key"
   end
 
   def test_validates_service_url_claim
@@ -238,24 +239,27 @@ class JwtValidatorTest < Minitest::Test
   def test_accepts_missing_kid_only_when_one_signing_key_is_available
     rsa, _kid, cloud, http = validator_parts
     token = JwtTestHelper.token(rsa:, kid: nil, payload: valid_payload)
-    validator = clocked_validator(cloud:, http:)
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
 
-    validator.cache_time = 600
     http.responses[keys_uri]["keys"] << JwtTestHelper.jwk_for(rsa, kid: "second")
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
   end
 
-  def test_fetches_unknown_key_immediately_after_cache_population
+  def test_refreshes_rotated_keys_after_the_default_fifteen_minute_grace
     rsa, kid, cloud, http = validator_parts
     rotated_rsa = OpenSSL::PKey::RSA.generate(2048)
     validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
     validator.validate!("Bearer #{token}")
 
-    http.responses[keys_uri] = { "keys" => [JwtTestHelper.jwk_for(rotated_rsa, kid: "rotated")] }
+    http.responses[keys_uri] = { "keys" => [JwtTestHelper.jwk_for(rsa, kid:), JwtTestHelper.jwk_for(rotated_rsa, kid: "rotated")] }
     rotated = JwtTestHelper.token(rsa: rotated_rsa, kid: "rotated", payload: valid_payload)
 
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{rotated}") }
+    assert_equal 1, http.gets.count(keys_uri)
+    age_cached_keys(validator, seconds: 901)
     assert_equal "client-id", validator.validate!("Bearer #{rotated}")["aud"]
     assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
     assert_equal 2, http.gets.count(keys_uri)
@@ -265,7 +269,7 @@ class JwtValidatorTest < Minitest::Test
     assert_includes error.message, "Signature verification failed"
   end
 
-  def test_caches_only_the_requested_key_not_the_entire_document
+  def test_caches_the_entire_document_including_other_signing_keys
     rsa, kid, cloud, http = validator_parts
     http.responses[keys_uri]["keys"] << JwtTestHelper.jwk_for(rsa, kid: "second")
     validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
@@ -276,10 +280,10 @@ class JwtValidatorTest < Minitest::Test
     validator.validate!("Bearer #{second}")
     validator.validate!("Bearer #{second}")
 
-    assert_equal 2, http.gets.count(keys_uri)
+    assert_equal 1, http.gets.count(keys_uri)
   end
 
-  def test_does_not_cache_or_rate_limit_missing_keys
+  def test_missing_keys_do_not_refresh_again_within_the_default_grace_period
     rsa, _kid, cloud, http = validator_parts
     validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     unknown = JwtTestHelper.token(rsa:, kid: "unknown", payload: valid_payload)
@@ -287,35 +291,32 @@ class JwtValidatorTest < Minitest::Test
     12.times do
       assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{unknown}") }
     end
-    assert_equal 12, http.gets.count(keys_uri)
+    assert_equal 1, http.gets.count(keys_uri)
 
     http.responses[keys_uri]["keys"] << JwtTestHelper.jwk_for(rsa, kid: "unknown")
+    age_cached_keys(validator, seconds: 901)
     assert_equal "client-id", validator.validate!("Bearer #{unknown}")["aud"]
-    assert_equal 13, http.gets.count(keys_uri)
+    assert_equal 2, http.gets.count(keys_uri)
   end
 
-  def test_expires_keys_after_ten_minutes_without_extending_ttl_on_hits
+  def test_known_keys_do_not_expire_without_an_unknown_key_triggering_refresh
     rsa, kid, cloud, http = validator_parts
-    validator = clocked_validator(cloud:, http:)
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
     validator.validate!("Bearer #{token}")
 
-    validator.cache_time = 599
+    http.responses[keys_uri] = { "keys" => [] }
+    age_cached_keys(validator, seconds: 86_400)
     validator.validate!("Bearer #{token}")
     assert_equal 1, http.gets.count(keys_uri)
 
-    http.responses[keys_uri] = { "keys" => [] }
-    validator.cache_time = 600
-    error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
-    assert_equal "JWT signing key was not found", error.message
+    unknown = JwtTestHelper.token(rsa:, kid: "unknown", payload: valid_payload)
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{unknown}") }
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
     assert_equal 2, http.gets.count(keys_uri)
-
-    http.responses[keys_uri] = { "keys" => [JwtTestHelper.jwk_for(rsa, kid:)] }
-    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
-    assert_equal 3, http.gets.count(keys_uri)
   end
 
-  def test_evicts_the_least_recently_used_key_after_five_entries_per_endpoint
+  def test_caches_more_than_five_keys_and_keeps_endpoints_independent
     rsa, _kid, cloud, http = validator_parts
     http.responses[keys_uri] = { "keys" => 6.times.map { |i| JwtTestHelper.jwk_for(rsa, kid: "key-#{i}") } }
     tenant_uri = "#{cloud.login_endpoint}/tenant-1/discovery/v2.0/keys"
@@ -329,43 +330,42 @@ class JwtValidatorTest < Minitest::Test
     validator.validate!("Bearer #{tokens[0]}")
     validator.validate!("Bearer #{tokens[5]}")
     validator.validate!("Bearer #{tokens[0]}")
-    assert_equal 6, http.gets.count(keys_uri)
+    assert_equal 1, http.gets.count(keys_uri)
 
     validator.validate!("Bearer #{tokens[1]}")
-    assert_equal 7, http.gets.count(keys_uri)
+    assert_equal 1, http.gets.count(keys_uri)
     validator.validate!("Bearer #{tenant_token}")
     assert_equal 1, http.gets.count(tenant_uri)
   end
 
-  def test_failed_fetches_reject_authentication_without_stale_fallback_or_retry_delay
+  def test_failed_unknown_key_refresh_discards_the_previous_set_but_can_retry
     rsa, kid, cloud, http = validator_parts
-    validator = clocked_validator(cloud:, http:)
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
     validator.validate!("Bearer #{token}")
-    http.responses[keys_uri] = Teams::HttpError.new("JWKS unavailable", status: 503, headers: {}, body: "")
+    age_cached_keys(validator, seconds: 901)
+    http.responses[keys_uri] = Net::ReadTimeout.new("JWKS unavailable")
     missing = JwtTestHelper.token(rsa:, kid: "missing", payload: valid_payload)
 
     error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{missing}") }
     assert_includes error.message, "JWKS unavailable"
-    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
-
-    validator.cache_time = 600
     assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
     http.responses[keys_uri] = { "keys" => [JwtTestHelper.jwk_for(rsa, kid:)] }
     assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
     assert_equal 4, http.gets.count(keys_uri)
   end
 
-  def test_rejects_malformed_key_responses_and_retries_without_caching_errors
+  def test_rejects_malformed_key_responses_and_network_failures
     rsa, kid, cloud, http = validator_parts
-    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
-    [nil, "not JSON", { "keys" => {} }, { "keys" => [{ "kid" => kid, "kty" => "RSA" }] }, Faraday::TimeoutError.new("timed out")].each do |response|
+    [nil, "not JSON", { "keys" => {} }, { "keys" => [{ "kid" => kid, "kty" => "RSA" }] }, Net::ReadTimeout.new("timed out")].each do |response|
+      validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
       http.responses[keys_uri] = response
       assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
     end
 
     http.responses[keys_uri] = { "keys" => [JwtTestHelper.jwk_for(rsa, kid:)] }
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
     assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
     assert_equal 6, http.gets.count(keys_uri)
   end
@@ -381,6 +381,23 @@ class JwtValidatorTest < Minitest::Test
 
     http.responses[cloud.open_id_metadata_url] = { "jwks_uri" => keys_uri }
     assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+  end
+
+  def test_http_error_body_can_be_cached_as_an_empty_set_until_the_grace_period_passes
+    rsa, kid, cloud, http = validator_parts
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
+    token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
+    stub_request(:get, keys_uri).to_return(
+      { status: 503, body: JSON.generate("error" => "unavailable") },
+      { status: 200, body: JSON.generate("keys" => [JwtTestHelper.jwk_for(rsa, kid:)]) }
+    )
+
+    2.times { assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") } }
+    assert_requested(:get, keys_uri, times: 1)
+
+    age_cached_keys(validator, seconds: 901)
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+    assert_requested(:get, keys_uri, times: 2)
   end
 
   def test_concurrent_requests_share_a_successful_key_fetch
@@ -415,7 +432,7 @@ class JwtValidatorTest < Minitest::Test
     token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload.merge("serviceurl" => teams_payload["serviceUrl"]))
     options = { input: JSON.generate(teams_payload), "CONTENT_TYPE" => "application/json", "HTTP_AUTHORIZATION" => "Bearer #{token}" }
 
-    http.responses[keys_uri] = Teams::HttpError.new("JWKS unavailable", status: 503, headers: {}, body: "")
+    http.responses[keys_uri] = Net::ReadTimeout.new("JWKS unavailable")
     response = request.post("/api/messages", options)
     assert_equal 401, response.status
     assert_includes output.string, "Rejected Teams request (401)"
@@ -433,19 +450,10 @@ class JwtValidatorTest < Minitest::Test
     "https://login.example.com/keys"
   end
 
-  def clocked_validator(cloud:, http:)
-    klass = Class.new(Teams::Auth::JwtValidator) do
-      attr_accessor :cache_time
-
-      private
-
-      def monotonic_time
-        cache_time
-      end
-    end
-    validator = klass.new(client_id: "client-id", cloud:, http:)
-    validator.cache_time = 0
-    validator
+  def age_cached_keys(validator, seconds:)
+    provider = validator.instance_variable_get(:@jwks_loaders).fetch(keys_uri)
+    entry = provider.cache.fetch(keys_uri)
+    provider.cache.store(keys_uri, entry.merge(fetched_at: Time.now - seconds))
   end
 
   def validator_parts
@@ -464,6 +472,9 @@ class JwtValidatorTest < Minitest::Test
       "https://login.example.com/.well-known/openidconfiguration" => { "jwks_uri" => "https://login.example.com/keys" },
       "https://login.example.com/keys" => { "keys" => [JwtTestHelper.jwk_for(rsa, kid:)] }
     )
+    stub_request(:get, %r{\Ahttps://login\.example\.com/(?:keys|tenant-1/discovery/v2\.0/keys)\z}).to_return do |request|
+      { status: 200, body: JSON.generate(http.get("#{cloud.login_endpoint}#{request.uri.path}")), headers: { "Content-Type" => "application/json" } }
+    end
 
     [rsa, kid, cloud, http]
   end
