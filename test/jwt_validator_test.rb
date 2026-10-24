@@ -196,7 +196,176 @@ class JwtValidatorTest < Minitest::Test
     assert_equal "https://sts.windows.net/tenant-1/", payload["iss"]
   end
 
+  def test_refreshes_signing_keys_after_rotation_without_restarting
+    rsa, kid, cloud, http = validator_parts
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
+    now = 0
+    validator.define_singleton_method(:monotonic_time) { now }
+    token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
+    validator.validate!("Bearer #{token}")
+
+    rotated_rsa = OpenSSL::PKey::RSA.generate(2048)
+    http.responses["https://login.example.com/keys"] = {
+      "keys" => [JwtTestHelper.jwk_for(rsa, kid:), JwtTestHelper.jwk_for(rotated_rsa, kid: "rotated-kid")]
+    }
+    rotated_token = JwtTestHelper.token(rsa: rotated_rsa, kid: "rotated-kid", payload: valid_payload)
+    now = 300
+
+    assert_equal "client-id", validator.validate!("Bearer #{rotated_token}")["aud"]
+    assert_equal 2, http.gets.count("https://login.example.com/keys")
+
+    forged_token = JwtTestHelper.token(rsa:, kid: "rotated-kid", payload: valid_payload)
+    error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{forged_token}") }
+    assert_equal "JWT signature is invalid", error.message
+  end
+
+  def test_throttles_unknown_key_refreshes_per_issuer
+    validator, http, clock, token = cached_validator
+    rsa = OpenSSL::PKey::RSA.generate(2048)
+    unknown_token = JwtTestHelper.token(rsa:, kid: "unknown", payload: valid_payload)
+    clock[:now] = 299
+
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{unknown_token}") }
+    assert_equal 1, http.gets.count("https://login.example.com/keys")
+
+    clock[:now] = 300
+    error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{unknown_token}") }
+    assert_equal "JWT signing key was not found", error.message
+    another_token = JwtTestHelper.token(rsa:, kid: "another-unknown", payload: valid_payload)
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{another_token}") }
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+    assert_equal 2, http.gets.count("https://login.example.com/keys")
+  end
+
+  def test_refreshes_expired_keys_and_rediscovers_the_key_set_url
+    validator, http, clock, token = cached_validator
+    rsa = OpenSSL::PKey::RSA.generate(2048)
+    http.responses["https://login.example.com/.well-known/openidconfiguration"] = {
+      "jwks_uri" => "https://login.example.com/rotated-keys"
+    }
+    http.responses["https://login.example.com/rotated-keys"] = {
+      "keys" => [JwtTestHelper.jwk_for(rsa, kid: "new-kid")]
+    }
+    clock[:now] = 24 * 60 * 60 - 1
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+    assert_equal 2, http.gets.length
+
+    clock[:now] += 1
+    error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
+    assert_equal "JWT signing key was not found", error.message
+    new_token = JwtTestHelper.token(rsa:, kid: "new-kid", payload: valid_payload)
+    assert_equal "client-id", validator.validate!("Bearer #{new_token}")["aud"]
+    assert_equal 2, http.gets.count("https://login.example.com/.well-known/openidconfiguration")
+    assert_equal 1, http.gets.count("https://login.example.com/rotated-keys")
+  end
+
+  def test_failed_refresh_is_throttled_without_replacing_unexpired_keys
+    validator, http, clock, token = cached_validator
+    keys_url = "https://login.example.com/keys"
+    keys = http.responses.fetch(keys_url)
+    http.responses[keys_url] = Teams::HttpError.new("Key endpoint unavailable", status: 503, headers: {}, body: "")
+    rsa = OpenSSL::PKey::RSA.generate(2048)
+    unknown_token = JwtTestHelper.token(rsa:, kid: "unknown", payload: valid_payload)
+    clock[:now] = 300
+
+    assert_raises(Teams::HttpError) { validator.validate!("Bearer #{unknown_token}") }
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{unknown_token}") }
+    assert_equal 2, http.gets.count(keys_url)
+
+    http.responses[keys_url] = { "keys" => keys.fetch("keys") + [JwtTestHelper.jwk_for(rsa, kid: "unknown")] }
+    clock[:now] = 600
+    assert_equal "client-id", validator.validate!("Bearer #{unknown_token}")["aud"]
+    assert_equal 3, http.gets.count(keys_url)
+  end
+
+  def test_failed_expiry_refresh_does_not_use_expired_keys
+    validator, http, clock, token = cached_validator
+    keys_url = "https://login.example.com/keys"
+    keys = http.responses.fetch(keys_url)
+    http.responses[keys_url] = Teams::HttpError.new("Key endpoint unavailable", status: 503, headers: {}, body: "")
+    clock[:now] = 24 * 60 * 60
+
+    assert_raises(Teams::HttpError) { validator.validate!("Bearer #{token}") }
+    error = assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
+    assert_equal "JWT signing keys are unavailable or expired", error.message
+    assert_equal 2, http.gets.count(keys_url)
+
+    http.responses[keys_url] = keys
+    clock[:now] += 300
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+  end
+
+  def test_failed_initial_fetch_is_throttled_and_can_recover
+    rsa, kid, cloud, http = validator_parts
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
+    now = 0
+    validator.define_singleton_method(:monotonic_time) { now }
+    token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
+    metadata = http.responses.fetch(cloud.open_id_metadata_url)
+    http.responses[cloud.open_id_metadata_url] = Teams::HttpError.new("Discovery unavailable", status: 503, headers: {}, body: "")
+
+    assert_raises(Teams::HttpError) { validator.validate!("Bearer #{token}") }
+    assert_raises(Teams::AuthenticationError) { validator.validate!("Bearer #{token}") }
+    assert_equal 1, http.gets.length
+
+    http.responses[cloud.open_id_metadata_url] = metadata
+    now = 300
+    assert_equal "client-id", validator.validate!("Bearer #{token}")["aud"]
+  end
+
+  def test_concurrent_rotation_requests_refresh_once
+    validator, http, clock, _token = cached_validator
+    rsa = OpenSSL::PKey::RSA.generate(2048)
+    http.responses["https://login.example.com/keys"] = lambda do
+      sleep 0.02
+      { "keys" => [JwtTestHelper.jwk_for(rsa, kid: "rotated-kid")] }
+    end
+    token = JwtTestHelper.token(rsa:, kid: "rotated-kid", payload: valid_payload)
+    clock[:now] = 300
+
+    results = Array.new(8) { Thread.new { validator.validate!("Bearer #{token}") } }.map(&:value)
+
+    assert(results.all? { |payload| payload["aud"] == "client-id" })
+    assert_equal 2, http.gets.count("https://login.example.com/keys")
+    assert_equal 2, http.gets.count("https://login.example.com/.well-known/openidconfiguration")
+  end
+
+  def test_refreshes_tenant_keys_independently_of_bot_framework_keys
+    rsa, kid, cloud, http = validator_parts
+    tenant_url = "https://login.example.com/tenant-1/discovery/v2.0/keys"
+    http.responses[tenant_url] = { "keys" => [JwtTestHelper.jwk_for(rsa, kid:)] }
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", tenant_id: "tenant-1", cloud:, http:)
+    now = 0
+    validator.define_singleton_method(:monotonic_time) { now }
+    bot_token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
+    tenant_payload = valid_payload.merge("iss" => "https://sts.windows.net/tenant-1/")
+    tenant_token = JwtTestHelper.token(rsa:, kid:, payload: tenant_payload)
+    validator.validate!("Bearer #{bot_token}")
+    validator.validate!("Bearer #{tenant_token}")
+
+    rotated_rsa = OpenSSL::PKey::RSA.generate(2048)
+    http.responses[tenant_url] = { "keys" => [JwtTestHelper.jwk_for(rotated_rsa, kid: "rotated-kid")] }
+    rotated_token = JwtTestHelper.token(rsa: rotated_rsa, kid: "rotated-kid", payload: tenant_payload)
+    now = 300
+
+    assert_equal tenant_payload["iss"], validator.validate!("Bearer #{rotated_token}")["iss"]
+    assert_equal "client-id", validator.validate!("Bearer #{bot_token}")["aud"]
+    assert_equal 2, http.gets.count(tenant_url)
+    assert_equal 1, http.gets.count("https://login.example.com/keys")
+  end
+
   private
+
+  def cached_validator
+    rsa, kid, cloud, http = validator_parts
+    validator = Teams::Auth::JwtValidator.new(client_id: "client-id", cloud:, http:)
+    clock = { now: 0 }
+    validator.define_singleton_method(:monotonic_time) { clock[:now] }
+    token = JwtTestHelper.token(rsa:, kid:, payload: valid_payload)
+    validator.validate!("Bearer #{token}")
+    [validator, http, clock, token]
+  end
 
   def validator_parts
     rsa = OpenSSL::PKey::RSA.generate(2048)

@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh cached JWT signing keys after 24 hours or on an unknown key ID (at most once every five minutes per issuer), including OpenID key discovery, so Microsoft signing-key rotation does not require restarting the bot. Concurrent refreshes are serialized, failed fetches are throttled and propagated, and expired keys are never used.
+
 ## [2.0.2] - 2026-08-06
 
 ### Added

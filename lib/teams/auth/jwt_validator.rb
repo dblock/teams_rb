@@ -7,12 +7,16 @@ require "openssl"
 module Teams
   module Auth
     class JwtValidator
+      JWKS_CACHE_TTL = 24 * 60 * 60
+      JWKS_REFRESH_INTERVAL = 5 * 60
+
       def initialize(client_id:, tenant_id: nil, cloud: PUBLIC_CLOUD, http: nil)
         @client_id = client_id
         @tenant_id = tenant_id
         @cloud = cloud
         @http = http || Common::HttpClient.new
         @jwks = {}
+        @jwks_refresh_times = {}
         # The validator is shared across request threads; the mutex keeps
         # concurrent cold-cache requests from fetching the JWKS repeatedly.
         @jwks_mutex = Mutex.new
@@ -27,7 +31,7 @@ module Teams
         header, payload, signing_input, signature = decode(token)
         validate_claims!(payload)
         validate_service_url!(payload, service_url) if service_url
-        verify_signature!(header, signing_input, signature)
+        verify_signature!(header, payload["iss"], signing_input, signature)
         payload
       end
 
@@ -71,10 +75,10 @@ module Teams
         raise AuthenticationError, "Service URL mismatch. Token: #{normalized_token_url}, Expected: #{normalized_expected_url}"
       end
 
-      def verify_signature!(header, signing_input, signature)
+      def verify_signature!(header, issuer, signing_input, signature)
         raise AuthenticationError, "only RS256 JWTs are supported" unless header["alg"] == "RS256"
 
-        key = jwks_for_issuer(signing_input).fetch("keys").find { |candidate| candidate["kid"] == header["kid"] }
+        key = signing_key(issuer, header["kid"])
         raise AuthenticationError, "JWT signing key was not found" unless key
 
         public_key = rsa_public_key(key)
@@ -83,14 +87,35 @@ module Teams
         end
       end
 
-      def jwks_for_issuer(signing_input)
-        _header_segment, payload_segment = signing_input.split(".", 2)
-        payload = JSON.parse(Base64.urlsafe_decode64(pad(payload_segment)))
-        uri = jwks_uri_for_issuer(payload["iss"])
+      def signing_key(issuer, kid)
+        @jwks_mutex.synchronize do
+          now = monotonic_time
+          cached = @jwks[issuer]
+          key = cached&.fetch(:keys)&.find { |candidate| candidate["kid"] == kid }
+          expired = !cached || now >= cached.fetch(:expires_at)
+          last_refresh = @jwks_refresh_times[issuer]
 
-        @jwks_mutex.synchronize { @jwks[uri] ||= @http.get(uri) }
-      rescue JSON::ParserError, ArgumentError
-        raise AuthenticationError, "JWT is malformed"
+          # Unknown kids are untrusted input; throttle attempts, including failures.
+          if (expired || !key) && (!last_refresh || now - last_refresh >= JWKS_REFRESH_INTERVAL)
+            @jwks_refresh_times[issuer] = now
+            keys = @http.get(jwks_uri_for_issuer(issuer)).fetch("keys")
+            raise AuthenticationError, "JWT signing keys response is invalid" unless keys.is_a?(Array)
+
+            cached = { keys:, expires_at: monotonic_time + JWKS_CACHE_TTL }
+            @jwks[issuer] = cached
+            key = keys.find { |candidate| candidate["kid"] == kid }
+          end
+
+          unless cached && monotonic_time < cached.fetch(:expires_at)
+            raise AuthenticationError, "JWT signing keys are unavailable or expired"
+          end
+
+          key
+        end
+      end
+
+      def monotonic_time
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
       def jwks_uri_for_issuer(issuer)
@@ -101,12 +126,8 @@ module Teams
       end
 
       def bot_framework_jwks_uri
-        @jwks_mutex.synchronize do
-          @bot_framework_jwks_uri ||= begin
-            metadata = @http.get(@cloud.open_id_metadata_url)
-            metadata.fetch("jwks_uri")
-          end
-        end
+        metadata = @http.get(@cloud.open_id_metadata_url)
+        metadata.fetch("jwks_uri")
       end
 
       def entra_jwks_uri
